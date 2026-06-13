@@ -163,9 +163,25 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
         runner = DistillationRunner(env, agent_cfg.to_dict(), log_dir=None, device=agent_cfg.device)
     else:
         raise ValueError(f"Unsupported runner class: {agent_cfg.class_name}")
+    # Save original path before conversion (converted file loses obs_norm_state_dict)
+    original_resume_path = resume_path
     # convert pre-5.0 published checkpoints to the layout expected by rsl-rl >= 5.0 (no-op otherwise)
     resume_path = handle_deprecated_rsl_rl_checkpoint(resume_path, installed_version)
-    runner.load(resume_path)
+    runner.load(resume_path, strict=False)  # strict=False for backward compat with pre-5.0 checkpoints
+
+    # Restore obs normalizer stats from original pre-5.0 checkpoint (avoids jittery inference)
+    import torch as _torch
+    _raw = _torch.load(original_resume_path, map_location="cpu", weights_only=False)
+    if "obs_norm_state_dict" in _raw:
+        _actor = runner.alg.actor
+        if hasattr(_actor, "obs_normalizer"):
+            _device = next(_actor.parameters()).device
+            _sd = _raw["obs_norm_state_dict"]
+            _actor.obs_normalizer._mean.data.copy_(_sd["_mean"].to(_device))
+            _actor.obs_normalizer._var.data.copy_(_sd["_var"].to(_device))
+            _actor.obs_normalizer._std.data.copy_(_sd["_std"].to(_device))
+            _actor.obs_normalizer.count.fill_(1_000_000)
+            print("[INFO]: Restored obs_normalizer stats from pre-5.0 checkpoint — smooth inference enabled.")
 
     # obtain the trained policy for inference
     policy = runner.get_inference_policy(device=env.unwrapped.device)
